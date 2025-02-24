@@ -25,16 +25,21 @@ import transformer_engine.pytorch as te
 from transformer_engine.common.recipe import Format, DelayedScaling
 from transformer_engine.pytorch.distributed import prepare_te_modules_for_fsdp
 
+from transformers import LlamaForCausalLM
 
-def convert_model(hf_model: torch.nn.Module, config: dict) -> torch.nn.Module:
-    new_model = Fp8LLaMA(vocab_size=config['vocab_size'],
-                         embedding_dim=config['embedding_dim'],
-                         hidden_dim=config['hidden_dim'],
-                         num_layers=config['num_layers'],
-                         num_heads=config['num_heads'],
-                         num_kv_heads=config['num_kv_heads'],
-                         max_seq_len=config['max_seq_len'],
-                         eps=config['eps'])
+
+def convert_model(model: torch.nn.Module, hf_model_path: str,
+                  config: dict) -> torch.nn.Module:
+    hf_model = LlamaForCausalLM.from_pretrained(
+        hf_model_path,
+        use_cache=False,
+        torch_dtype=torch.bfloat16,
+        use_flash_attention_2=False,
+        max_position_embeddings=config['max_seq_len'],
+        local_files_only=True)
+
+    print(f'Loaded model from {hf_model_path}')
+    print(f'{len(hf_model.model.layers)} layers detected')
 
     # missing position_encoding: torch.Size([8192, 1, 1, 128]), torch.bfloat16
 
@@ -42,44 +47,51 @@ def convert_model(hf_model: torch.nn.Module, config: dict) -> torch.nn.Module:
     lm_head_w = hf_model.lm_head.weight.to(torch.float32)
     norm_w = hf_model.model.norm.weight.to(torch.float32)
 
-    new_model.embedding.weight.data.copy_(embed_tokens_w)
-    new_model.norm_lm_head.layer_norm_weight.data.copy_(norm_w)
-    new_model.norm_lm_head.weight.data.copy_(lm_head_w)
+    model.embedding.weight.data.copy_(embed_tokens_w)
+    model.norm_lm_head.layer_norm_weight.data.copy_(norm_w)
+    model.norm_lm_head.weight.data.copy_(lm_head_w)
 
     for i in range(config['num_layers']):
         hf_layer = hf_model.model.layers[i]
-        new_layer = new_model.layers[i]
+        new_layer = model.layers[i]
 
         # Multihead Attention
-        with hf_layer.self_attn as hf_self_attn, new_layer.self_attention as new_self_attention:
-            hf_self_attn_input_layernorm_w = hf_layer.input_layernorm.weight.to(
-                torch.float32)
-            hf_self_attn_qkv_w = torch.cat([
-                hf_self_attn.q_proj.weight, hf_self_attn.k_proj.weight,
-                hf_self_attn.v_proj.weight
-            ],
-                                           dim=-1).to(torch.float32)
-            hf_self_attn_o_w = hf_self_attn.o_proj.weight.to(torch.float32)
+        hf_self_attn = hf_layer.self_attn
+        new_self_attention = new_layer.self_attention
 
-            new_self_attention.layernorm_qkv.layer_norm_weight.data.copy_(
-                hf_self_attn_input_layernorm_w)
-            new_self_attention.layernorm_qkv.weight.copy_(hf_self_attn_qkv_w)
-            new_self_attention.proj.weight.copy_(hf_self_attn_o_w)
+        hf_self_attn_input_layernorm_w = hf_layer.input_layernorm.weight.to(
+            torch.float32)
+        hf_self_attn_qkv_w = torch.cat([
+            hf_self_attn.q_proj.weight, hf_self_attn.k_proj.weight,
+            hf_self_attn.v_proj.weight
+        ],
+                                       dim=-1).to(torch.float32)
+        hf_self_attn_o_w = hf_self_attn.o_proj.weight.to(torch.float32)
+
+        new_self_attention.layernorm_qkv.layer_norm_weight.data.copy_(
+            hf_self_attn_input_layernorm_w)
+        new_self_attention.layernorm_qkv.weight.copy_(hf_self_attn_qkv_w)
+        new_self_attention.proj.weight.copy_(hf_self_attn_o_w)
 
         # LayerNormMLP
-        with hf_layer.mlp as hf_mlp, new_layer.layernorm_mlp as new_mlp:
-            hf_mlp_post_attn_layernorm_w = new_layer.post_attention_layernorm.weight.to(
-                torch.float32)
-            hf_mlp_fc1_w = torch.cat(
-                [hf_mlp.gate_proj.weight, hf_mlp.up_proj.weight],
-                dim=0).to(torch.float32)
-            hf_mlp_fc2_w = hf_mlp.down_proj.weight.to(torch.float32)
+        hf_mlp = hf_layer.mlp
+        new_mlp = new_layer.layernorm_mlp
 
-            new_mlp.layer_norm_weight.copy_(hf_mlp_post_attn_layernorm_w)
-            new_mlp.fc1_weight.copy_(hf_mlp_fc1_w)
-            new_mlp.fc2_weight.copy_(hf_mlp_fc2_w)
+        hf_mlp_post_attn_layernorm_w = new_layer.post_attention_layernorm.weight.to(
+            torch.float32)
+        hf_mlp_fc1_w = torch.cat(
+            [hf_mlp.gate_proj.weight, hf_mlp.up_proj.weight],
+            dim=0).to(torch.float32)
+        hf_mlp_fc2_w = hf_mlp.down_proj.weight.to(torch.float32)
 
-    return new_model
+        new_mlp.layer_norm_weight.copy_(hf_mlp_post_attn_layernorm_w)
+        new_mlp.fc1_weight.copy_(hf_mlp_fc1_w)
+        new_mlp.fc2_weight.copy_(hf_mlp_fc2_w)
+
+        print(f'Layer #{i} conversion completed')
+    print(f'Whole model conversion completed')
+
+    return model
 
 
 class RandData(IterableDataset):
@@ -179,7 +191,12 @@ def train(
             layer_class = MistralBlock
             model = Mistral(**asdict(model_config))
 
-    model = convert_model(model, **asdict(model_config))
+    print("Entering convert_model")
+    model = convert_model(
+        model,
+        "/vast/huggingface/hub/models--regisss--llama2-70b-fused-qkv-mlperf/snapshots/647cb0c8858ddefd10231a20ddfa68e4eb5e850e/",
+        config)
+    print("Leaving convert_model")
 
     model_config.estimate_flops_per_token(
         model, batch_size)  # Need to calculate before wrapping in FSDP
