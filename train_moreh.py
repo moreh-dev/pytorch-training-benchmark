@@ -101,33 +101,31 @@ def convert_model(model: torch.nn.Module, hf_model_path: str,
     return model
 
 
-class RandData(IterableDataset):
+class HFIterableDataset(IterableDataset):
 
-    def __init__(self, vocab_size, max_seq_len, total_size):
+    def __init__(self, hf_dataset):
         super().__init__()
-        self.vocab_size = vocab_size
-        self.max_seq_len = max_seq_len
-        self.total_size = total_size
+        self.dataset = hf_dataset
 
     def __len__(self):
-        return self.total_size
+        return len(self.dataset)
 
     def __iter__(self):
-        datas = []
-        for i in range(self.total_size):
-            input = torch.randint(self.vocab_size, [self.max_seq_len],
-                                  dtype=torch.int64)
-            label = torch.cat(
-                [input[:-1], torch.randint(self.vocab_size, [1])])
-            datas.append((input, label))
-        return iter(datas)
+
+        for item in self.dataset:
+            input_ids = torch.tensor(item["input_ids"], dtype=torch.long)
+            labels = torch.tensor(item["labels"], dtype=torch.long)
+            yield {"input_ids": input_ids, "labels": labels}
 
 
-def create_dummy_data_loader(world_size, batch_size, num_iteration,
-                             model_config):
-    dataset = RandData(model_config.vocab_size, model_config.max_seq_len,
-                       batch_size * num_iteration * world_size)
-    data_loader = DataLoader(dataset,
+def create_train_data_loader(train_dataset_path, world_size, batch_size,
+                             num_iteration, model_config):
+    hf_dataset = load_dataset("parquet",
+                              data_files=train_dataset_path,
+                              split="train")
+    hf_iterable_dataset = HFIterableDataset(hf_dataset)
+
+    data_loader = DataLoader(hf_iterable_dataset,
                              batch_size=batch_size,
                              num_workers=world_size,
                              pin_memory=True,
@@ -138,6 +136,8 @@ def create_dummy_data_loader(world_size, batch_size, num_iteration,
 def train(
         config_file: str = "conigs/llama-3.1-70b.moreh.json",
         model_name: str = "llama",
+        model_path: str = "/path/to/model",
+        dataset_path: str = "/path/to/dataset",
         batch_size: int = 1,
         num_iteration: int = 128,
         grad_accumlate_pre_steps: int = 8,  # steps to accumlate gradient
@@ -198,12 +198,7 @@ def train(
             layer_class = MistralBlock
             model = Mistral(**asdict(model_config))
 
-    print("Entering convert_model")
-    model = convert_model(
-        model,
-        "/vast/huggingface/hub/models--regisss--llama2-70b-fused-qkv-mlperf/snapshots/647cb0c8858ddefd10231a20ddfa68e4eb5e850e/",
-        config)
-    print("Leaving convert_model")
+    model = convert_model(model, model_path, config)
 
     model_config.estimate_flops_per_token(
         model, batch_size)  # Need to calculate before wrapping in FSDP
@@ -253,8 +248,9 @@ def train(
     iter_times = []
     warm_up = num_iteration / 2
 
-    data_loader = create_dummy_data_loader(world_size, batch_size,
-                                           num_iteration, model_config)
+    data_loader = create_train_data_loader(dataset_path, world_size,
+                                           batch_size, num_iteration,
+                                           model_config)
     last_time = time.time()
 
     for step_idx, data_batch in enumerate(data_loader):
