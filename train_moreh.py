@@ -140,7 +140,7 @@ def train(
         model_path: str = "/path/to/model",
         dataset_path: str = "/path/to/dataset",
         batch_size: int = 1,
-        num_iteration: int = 128,
+        num_iteration: int = 128 * 16,
         grad_accumlate_pre_steps: int = 8,  # steps to accumlate gradient
         reduce_pre_steps: int = 32,  # steps to do all reduce
         enable_fp8: bool = True,
@@ -288,14 +288,16 @@ def train(
             current_time = time.time()
             iter_time = current_time - last_time
             token_per_sec = (batch_size * model_config.max_seq_len) / iter_time
+            avg_loss = ddp_loss[0] / ddp_loss[1]
+            accuracy = (logits.argmax(dim=-1) == labels).float().mean().item()
             if step_idx > warm_up:
                 print(
-                    f"Step: {step_idx}; TFLOP/s: {flops_per_iter/iter_time/1e12}; iteration time: {iter_time}; token per second: {token_per_sec}"
+                    f"Step: {step_idx}; TFLOP/s: {flops_per_iter/iter_time/1e12:.3f}; iteration time: {iter_time:.3f}; token per second: {token_per_sec:.3f}; loss: {avg_loss:.3f}; accuracy: {accuracy:.3f}"
                 )
                 iter_times.append(iter_time)
             else:
                 print(
-                    f"warming up iter: {step_idx}/{warm_up}; TFLOP/s: {flops_per_iter/iter_time/1e12}; iteration time: {iter_time}; token per second: {token_per_sec}"
+                    f"warming up iter: {step_idx}/{warm_up}; TFLOP/s: {flops_per_iter/iter_time/1e12:.3f}; iteration time: {iter_time:.3f}; token per second: {token_per_sec:.3f}; loss: {avg_loss:.3f}; accuracy: {accuracy:.3f}"
                 )
             last_time = current_time
 
@@ -303,13 +305,16 @@ def train(
             break
 
     if rank == 0:
-        iter_times = np.array(iter_times)
-        avg_iter_time = np.mean(iter_times)
-        print("Avg token per second:",
-              (batch_size * model_config.max_seq_len) / avg_iter_time)
-        print("Avg iter time:", avg_iter_time)
-        print("TFLOP per iteration:", flops_per_iter / 1e12)
-        print("Avg TFLOP/s,", flops_per_iter / avg_iter_time / 1e12)
+        if iter_times:
+            iter_times = np.array(iter_times)
+            avg_iter_time = np.mean(iter_times)
+            print("Avg token per second:",
+                  (batch_size * model_config.max_seq_len) / avg_iter_time)
+            print("Avg iter time:", avg_iter_time)
+            print("TFLOP per iteration:", flops_per_iter / 1e12)
+            print("Avg TFLOP/s,", flops_per_iter / avg_iter_time / 1e12)
+        else:
+            print("No iteration times recorded.")
         peak_memory = torch.cuda.max_memory_allocated(
             device=f"cuda:{local_rank}") * 1e-6
         print(f"Peak memory use = {peak_memory}MB")
