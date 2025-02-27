@@ -4,6 +4,7 @@ import json
 import time
 import numpy as np
 from dataclasses import asdict
+from datasets import load_dataset
 from contextlib import nullcontext
 from functools import partial
 from llama import LLaMAConfig, LLaMA, LLaMABlock, Fp8LLaMA, Fp8LLaMABlock
@@ -254,7 +255,9 @@ def train(
     last_time = time.time()
 
     for step_idx, data_batch in enumerate(data_loader):
-        input, labels = data_batch
+        input = data_batch["input_ids"]
+        labels = data_batch["labels"]
+
         input = input.to(local_rank)
         labels = labels.to(local_rank)
         fp8_context = nullcontext() if not enable_fp8 else te.fp8_autocast(
