@@ -26,81 +26,6 @@ import transformer_engine.pytorch as te
 from transformer_engine.common.recipe import Format, DelayedScaling
 from transformer_engine.pytorch.distributed import prepare_te_modules_for_fsdp
 
-from transformers import AutoModelForCausalLM
-
-
-def copy_weight(tensor_from, tensor_to):
-    if tensor_to.requires_grad:
-        with torch.no_grad():
-            tensor_to.data.copy_(tensor_from.detach())
-        tensor_to.requires_grad = True
-    else:
-        tensor_to.data.copy_(tensor_from.detach())
-
-
-def convert_model(model: torch.nn.Module, hf_model_path: str,
-                  config: dict) -> torch.nn.Module:
-    hf_model = AutoModelForCausalLM.from_pretrained(
-        hf_model_path,
-        use_cache=False,
-        torch_dtype=torch.bfloat16,
-        use_flash_attention_2=False,
-        max_position_embeddings=config['max_seq_len'],
-        local_files_only=True,
-        trust_remote_code=True)
-
-    print(f'Loaded model from {hf_model_path}')
-    print(f'{len(hf_model.model.layers)} layers detected')
-
-    # missing position_encoding: torch.Size([8192, 1, 1, 128]), torch.bfloat16
-
-    hf_embed_tokens_w = hf_model.model.embed_tokens.weight.to(torch.float32)
-    hf_lm_head_w = hf_model.lm_head.weight.to(torch.float32)
-    hf_norm_w = hf_model.model.norm.weight.to(torch.float32)
-
-    copy_weight(hf_embed_tokens_w, model.embedding.weight)
-    copy_weight(hf_lm_head_w, model.norm_lm_head.weight)
-    copy_weight(hf_norm_w, model.norm_lm_head.layer_norm_weight)
-
-    for i in range(config['num_layers']):
-        hf_layer = hf_model.model.layers[i]
-        new_layer = model.layers[i]
-
-        # Multihead Attention
-        hf_self_attn = hf_layer.self_attn
-        new_self_attention = new_layer.self_attention
-
-        hf_self_attn_input_layernorm_w = hf_layer.input_layernorm.weight.to(
-            torch.float32)
-        hf_self_attn_qkv_w = hf_self_attn.qkv_proj.weight.to(torch.float32)
-        hf_self_attn_o_w = hf_self_attn.o_proj.weight.to(torch.float32)
-
-        copy_weight(hf_self_attn_input_layernorm_w,
-                    new_self_attention.layernorm_qkv.layer_norm_weight)
-        copy_weight(hf_self_attn_qkv_w,
-                    new_self_attention.layernorm_qkv.weight)
-        copy_weight(hf_self_attn_o_w, new_self_attention.proj.weight)
-
-        # LayerNormMLP
-        hf_mlp = hf_layer.mlp
-        new_mlp = new_layer.layernorm_mlp
-
-        hf_mlp_post_attn_layernorm_w = hf_layer.post_attention_layernorm.weight.to(
-            torch.float32)
-        hf_mlp_fc1_w = torch.cat(
-            [hf_mlp.gate_proj.weight, hf_mlp.up_proj.weight],
-            dim=0).to(torch.float32)
-        hf_mlp_fc2_w = hf_mlp.down_proj.weight.to(torch.float32)
-
-        copy_weight(hf_mlp_post_attn_layernorm_w, new_mlp.layer_norm_weight)
-        copy_weight(hf_mlp_fc1_w, new_mlp.fc1_weight)
-        copy_weight(hf_mlp_fc2_w, new_mlp.fc2_weight)
-
-        print(f'Layer #{i} conversion completed')
-    print(f'Whole model conversion completed')
-
-    return model
-
 
 class HFIterableDataset(IterableDataset):
 
@@ -199,7 +124,8 @@ def train(
             layer_class = MistralBlock
             model = Mistral(**asdict(model_config))
 
-    model = convert_model(model, model_path, config)
+    # Load the pre-converted model
+    model.load_state_dict(torch.load(model_path, weights_only=False))
 
     model_config.estimate_flops_per_token(
         model, batch_size)  # Need to calculate before wrapping in FSDP
@@ -208,7 +134,7 @@ def train(
         print(
             f"Loaded model on CPU with number of parameters: {sum(p.numel() for p in model.parameters())/1e9:.2f}B"
         )
-        print(f"Original Model:\n{model}")
+        # print(f"Model:\n{model}")
 
     # FSDP
     model = FSDP(model,
