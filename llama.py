@@ -64,7 +64,7 @@ def apply_rotary_emb(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
-    
+
     #freqs_cis = freqs_cis[:, None, :]
     freqs_cis = freqs_cis[None, None, :, :]
 
@@ -77,11 +77,11 @@ class Attention(nn.Module):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.head_dim = embedding_dim // num_heads
-        self.kv_dim = embedding_dim * num_kv_heads // num_heads 
+        self.kv_dim = embedding_dim * num_kv_heads // num_heads
         self.in_proj = nn.Linear(embedding_dim, embedding_dim+2*self.kv_dim, bias=False)
         self.out_proj = nn.Linear(embedding_dim, embedding_dim, bias=False)
-        self.use_sdpa = torch.cuda.is_available() and 'MI3' not in torch.cuda.get_device_name() 
-    
+        self.use_sdpa = torch.cuda.is_available() and 'MI3' not in torch.cuda.get_device_name()
+
     def forward(self,input,position_encoding):
         qkv = self.in_proj(input)
         q,k,v = qkv.split([self.embedding_dim, self.kv_dim, self.kv_dim], -1)
@@ -90,7 +90,7 @@ class Attention(nn.Module):
         v = v.unflatten(-1, [-1, self.head_dim]).transpose(1, 2)
         q, k = apply_rotary_emb(q, k, position_encoding)
 
-        
+
         if self.use_sdpa:
             k = k.repeat_interleave(self.embedding_dim//self.kv_dim,1)
             v = v.repeat_interleave(self.embedding_dim//self.kv_dim,1)
@@ -110,7 +110,7 @@ class MLP(nn.Module):
         self.up_proj = nn.Linear(embedding_dim, hidden_dim, bias=False)
         self.gate_proj = nn.Linear(embedding_dim, hidden_dim, bias=False)
         self.down_proj = nn.Linear(hidden_dim, embedding_dim, bias=False)
-    
+
     def forward(self,input):
         hid = F.silu(self.gate_proj(input)) * self.up_proj(input)
         o = self.down_proj(hid)
@@ -124,7 +124,7 @@ class RMSNorm(nn.Module):
 
     def forward(self, input):
         # use high precision, see https://github.com/foundation-model-stack/foundation-model-stack/blob/d55a9f2ade65ef4157cdfd928300874e2348e5d0/fms/modules/layernorm.py#L64
-        input_float = input.float() 
+        input_float = input.float()
         output = (input_float * torch.rsqrt(input_float.pow(2).mean(-1, keepdim=True) + self.eps)).type_as(input) * self.weight
         return output
 
@@ -140,12 +140,12 @@ class LLaMABlock(nn.Module):
         hid = input + self.attn(self.attn_norm(input), position_encoding)
         output = hid + self.mlp(self.mlp_norm(hid))
         return output
-    
+
 def precompute_freq_cis(dim, max_seq_len):
     rope_base=500000.0
     assert dim % 2 == 0
     freqs = 1 / (rope_base ** (torch.arange(0, dim, 2).float() / dim))  # F = dim // 2
-    t = torch.arange(max_seq_len, device=freqs.device) 
+    t = torch.arange(max_seq_len, device=freqs.device)
     freqs = torch.outer(t, freqs).float()
     return torch.polar(torch.ones_like(freqs), freqs)
 
@@ -171,7 +171,44 @@ class LLaMA(nn.Module):
             x = layer(x, self.position_encoding)
         logits = self.lm_head(self.norm(x))
         return logits
-    
+
+# for model convert (caused from exceeding 192GB vram)
+'''
+class Fp8LLaMA(nn.Module):
+
+    def __init__(self, vocab_size, embedding_dim, hidden_dim, num_layers,
+                 num_heads, num_kv_heads, max_seq_len, eps):
+        super().__init__()
+
+        self.embedding = nn.Embedding(vocab_size, embedding_dim).to("cpu")
+
+        self.layers = nn.ModuleList([
+            Fp8LLaMABlock(embedding_dim, hidden_dim, num_heads, num_kv_heads,
+                          eps).to("cpu") for _ in range(num_layers)
+        ])
+
+        self.norm_lm_head = te.LayerNormLinear(embedding_dim,
+                                               vocab_size,
+                                               bias=False,
+                                               normalization='RMSNorm',
+                                               eps=eps).to("cpu")
+
+        position_encoding = te.attention.RotaryPositionEmbedding(
+            embedding_dim // num_heads)(max_seq_len=max_seq_len)
+        self.register_buffer('position_encoding',
+                             position_encoding.to(torch.bfloat16).to("cpu"))
+
+    def forward(self, idxs, is_first_microbatch):
+        x = self.embedding(idxs)  
+
+        for layer in self.layers:
+            x = layer(x,
+                      rotary_pos_emb=self.position_encoding,
+                      is_first_microbatch=is_first_microbatch)
+
+        logits = self.norm_lm_head(x)
+        return logits 
+'''
 class Fp8LLaMA(nn.Module):
     def __init__(self,vocab_size,embedding_dim,hidden_dim,num_layers,num_heads,num_kv_heads,max_seq_len,eps):
         super().__init__()
