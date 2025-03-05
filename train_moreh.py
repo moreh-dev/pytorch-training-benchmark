@@ -78,7 +78,7 @@ def train(
     world_size = int(os.environ["WORLD_SIZE"])
 
     enable_fp8 = True
-    enable_compile = False,
+    enable_compile = False
 
     # Construct process group
     if local_rank == 0:
@@ -93,6 +93,7 @@ def train(
     with open(config_file) as f:
         config = json.load(f)
 
+    layer_class = Fp8LLaMABlock
     model_config = LLaMAConfig(**config)
     if local_rank == 0:
         print("Creating model with config: ", model_config)
