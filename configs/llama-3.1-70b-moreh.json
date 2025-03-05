@@ -1,5 +1,5 @@
 {
-  "num_layers": 1,
+  "num_layers": 80,
   "num_heads": 64,
   "num_kv_heads": 8,
   "embedding_dim": 8192,

@@ -172,60 +172,38 @@ class LLaMA(nn.Module):
         logits = self.lm_head(self.norm(x))
         return logits
 
-# for model convert (caused from exceeding 192GB vram)
-'''
+
 class Fp8LLaMA(nn.Module):
 
     def __init__(self, vocab_size, embedding_dim, hidden_dim, num_layers,
                  num_heads, num_kv_heads, max_seq_len, eps):
         super().__init__()
-
-        self.embedding = nn.Embedding(vocab_size, embedding_dim).to("cpu")
-
-        self.layers = nn.ModuleList([
-            Fp8LLaMABlock(embedding_dim, hidden_dim, num_heads, num_kv_heads,
-                          eps).to("cpu") for _ in range(num_layers)
-        ])
-
-        self.norm_lm_head = te.LayerNormLinear(embedding_dim,
-                                               vocab_size,
-                                               bias=False,
-                                               normalization='RMSNorm',
-                                               eps=eps).to("cpu")
+        self.embedding = nn.Embedding(vocab_size,
+                                      embedding_dim).to(dtype=torch.bfloat16)
+        layers = []
+        for i in range(num_layers):
+            layers.append(
+                Fp8LLaMABlock(embedding_dim, hidden_dim, num_heads,
+                              num_kv_heads, eps).to(dtype=torch.bfloat16))
+        self.layers = nn.ModuleList(layers)
+        self.norm_lm_head = te.LayerNormLinear(
+            embedding_dim,
+            vocab_size,
+            bias=False,
+            normalization='RMSNorm',
+            eps=eps).to(dtype=torch.bfloat16)
 
         position_encoding = te.attention.RotaryPositionEmbedding(
             embedding_dim // num_heads)(max_seq_len=max_seq_len)
         self.register_buffer('position_encoding',
-                             position_encoding.to(torch.bfloat16).to("cpu"))
-
-    def forward(self, idxs, is_first_microbatch):
-        x = self.embedding(idxs)  
-
-        for layer in self.layers:
-            x = layer(x,
-                      rotary_pos_emb=self.position_encoding,
-                      is_first_microbatch=is_first_microbatch)
-
-        logits = self.norm_lm_head(x)
-        return logits 
-'''
-class Fp8LLaMA(nn.Module):
-    def __init__(self,vocab_size,embedding_dim,hidden_dim,num_layers,num_heads,num_kv_heads,max_seq_len,eps):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embedding_dim)
-        layers = []
-        for i in range(num_layers):
-            layers.append(Fp8LLaMABlock(embedding_dim,hidden_dim,num_heads,num_kv_heads,eps))
-        self.layers = nn.ModuleList(layers)
-        self.norm_lm_head = te.LayerNormLinear(embedding_dim, vocab_size, bias=False,normalization='RMSNorm', eps=eps)
-
-        position_encoding = te.attention.RotaryPositionEmbedding(embedding_dim//num_heads)(max_seq_len=max_seq_len)
-        self.register_buffer('position_encoding', position_encoding.to(torch.bfloat16))
+                             position_encoding.to(torch.bfloat16))
 
     def forward(self, idxs, is_first_microbatch):
         x = self.embedding(idxs)
         for layer in self.layers:
-            x = layer(x, rotary_pos_emb=self.position_encoding, is_first_microbatch=is_first_microbatch)
+            x = layer(x,
+                      rotary_pos_emb=self.position_encoding,
+                      is_first_microbatch=is_first_microbatch)
         logits = self.norm_lm_head(x)
         return logits
 

@@ -7,13 +7,25 @@ from mistral import MistralConfig, Mistral, Fp8Mistral
 from transformers import AutoModelForCausalLM
 
 
+class Fp8LLaMACPU(Fp8LLaMA):
+
+    def __init__(self, vocab_size, embedding_dim, hidden_dim, num_layers,
+                 num_heads, num_kv_heads, max_seq_len, eps):
+        super().__init__(vocab_size, embedding_dim, hidden_dim, num_layers,
+                         num_heads, num_kv_heads, max_seq_len, eps)
+        self.embedding = self.embedding.to("cpu")
+        for i in range(num_layers):
+            self.layers[i] = self.layers[i].to("cpu")
+        self.norm_lm_head = self.norm_lm_head.to("cpu")
+
+
 def copy_weight(tensor_from, tensor_to):
     if tensor_to.requires_grad:
         with torch.no_grad():
-            tensor_to.data.copy_(tensor_from.detach().cpu())
+            tensor_to.data.copy_(tensor_from.detach())
         tensor_to.requires_grad = True
     else:
-        tensor_to.data.copy_(tensor_from.detach().cpu())
+        tensor_to.data.copy_(tensor_from.detach())
 
 
 def convert_model(model: torch.nn.Module, hf_model_path: str,
@@ -33,14 +45,16 @@ def convert_model(model: torch.nn.Module, hf_model_path: str,
     print(f'{len(hf_model.model.layers)} layers detected')
 
     # CPU RAM 활용
-    hf_embed_tokens_w = hf_model.model.embed_tokens.weight.to(
-        torch.float32).cpu()
-    hf_lm_head_w = hf_model.lm_head.weight.to(torch.float32).cpu()
-    hf_norm_w = hf_model.model.norm.weight.to(torch.float32).cpu()
+    hf_embed_tokens_w = hf_model.model.embed_tokens.weight.cpu()
+    hf_lm_head_w = hf_model.lm_head.weight.cpu()
+    hf_norm_w = hf_model.model.norm.weight.cpu()
 
     copy_weight(hf_embed_tokens_w, model.embedding.weight)
     copy_weight(hf_lm_head_w, model.norm_lm_head.weight)
     copy_weight(hf_norm_w, model.norm_lm_head.layer_norm_weight)
+
+    print(f'hf_embed_tokens_w: {hf_embed_tokens_w.dtype}')
+    print(f'model.embedding.weight: {model.embedding.weight.dtype}')
 
     del hf_embed_tokens_w, hf_lm_head_w, hf_norm_w
     torch.cuda.empty_cache()
@@ -53,11 +67,9 @@ def convert_model(model: torch.nn.Module, hf_model_path: str,
         hf_self_attn = hf_layer.self_attn
         new_self_attention = new_layer.self_attention
 
-        hf_self_attn_input_layernorm_w = hf_layer.input_layernorm.weight.to(
-            torch.float32).cpu()
-        hf_self_attn_qkv_w = hf_self_attn.qkv_proj.weight.to(
-            torch.float32).cpu()
-        hf_self_attn_o_w = hf_self_attn.o_proj.weight.to(torch.float32).cpu()
+        hf_self_attn_input_layernorm_w = hf_layer.input_layernorm.weight.cpu()
+        hf_self_attn_qkv_w = hf_self_attn.qkv_proj.weight.cpu()
+        hf_self_attn_o_w = hf_self_attn.o_proj.weight.cpu()
 
         copy_weight(hf_self_attn_input_layernorm_w,
                     new_self_attention.layernorm_qkv.layer_norm_weight)
@@ -72,12 +84,11 @@ def convert_model(model: torch.nn.Module, hf_model_path: str,
         hf_mlp = hf_layer.mlp
         new_mlp = new_layer.layernorm_mlp
 
-        hf_mlp_post_attn_layernorm_w = hf_layer.post_attention_layernorm.weight.to(
-            torch.float32).cpu()
+        hf_mlp_post_attn_layernorm_w = hf_layer.post_attention_layernorm.weight.cpu(
+        )
         hf_mlp_fc1_w = torch.cat(
-            [hf_mlp.gate_proj.weight, hf_mlp.up_proj.weight],
-            dim=0).to(torch.float32).cpu()
-        hf_mlp_fc2_w = hf_mlp.down_proj.weight.to(torch.float32).cpu()
+            [hf_mlp.gate_proj.weight, hf_mlp.up_proj.weight], dim=0).cpu()
+        hf_mlp_fc2_w = hf_mlp.down_proj.weight.cpu()
 
         copy_weight(hf_mlp_post_attn_layernorm_w, new_mlp.layer_norm_weight)
         copy_weight(hf_mlp_fc1_w, new_mlp.fc1_weight)
@@ -95,38 +106,18 @@ def convert_model(model: torch.nn.Module, hf_model_path: str,
     return model
 
 
-def convert_and_save_model(config_file: str,
-                           model_name: str,
-                           hf_model_path: str,
-                           save_path: str,
-                           enable_fp8: bool = True):
+def convert_and_save_model(config_file: str, hf_model_path: str,
+                           save_path: str):
     with open(config_file) as f:
         config = json.load(f)
 
-    if model_name == "llama":
-        model_config = LLaMAConfig(**config)
-    elif model_name == "mistral":
-        model_config = MistralConfig(**config)
-    else:
-        print(
-            "Model not supported. Please pass either 'llama' or 'mistral' as a parameter."
-        )
-        return
+    model_config = LLaMAConfig(**config)
 
-    if enable_fp8:
-        if model_name == "llama":
-            model = Fp8LLaMA(**asdict(model_config))
-        elif model_name == "mistral":
-            model = Fp8Mistral(**asdict(model_config))
-    else:
-        if model_name == "llama":
-            model = LLaMA(**asdict(model_config))
-        elif model_name == "mistral":
-            model = Mistral(**asdict(model_config))
-
-    model.to("cpu")  # CPU에서 변환 진행
-
+    model = Fp8LLaMA(**asdict(model_config))
     model = convert_model(model, hf_model_path, config)
+
+    for name, param in model.named_parameters():
+        print(f"Parameter: {name}, dtype: {param.dtype}")
 
     torch.save(model.state_dict(), save_path)
     print(f'Model saved to {save_path}')
