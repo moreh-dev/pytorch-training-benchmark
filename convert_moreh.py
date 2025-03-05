@@ -1,22 +1,10 @@
 import fire
 import json
+import os
 import torch
 from dataclasses import asdict
-from llama import LLaMAConfig, LLaMA, Fp8LLaMA
-from mistral import MistralConfig, Mistral, Fp8Mistral
+from llama import LLaMAConfig, Fp8LLaMA
 from transformers import AutoModelForCausalLM
-
-
-class Fp8LLaMACPU(Fp8LLaMA):
-
-    def __init__(self, vocab_size, embedding_dim, hidden_dim, num_layers,
-                 num_heads, num_kv_heads, max_seq_len, eps):
-        super().__init__(vocab_size, embedding_dim, hidden_dim, num_layers,
-                         num_heads, num_kv_heads, max_seq_len, eps)
-        self.embedding = self.embedding.to("cpu")
-        for i in range(num_layers):
-            self.layers[i] = self.layers[i].to("cpu")
-        self.norm_lm_head = self.norm_lm_head.to("cpu")
 
 
 def copy_weight(tensor_from, tensor_to):
@@ -106,6 +94,38 @@ def convert_model(model: torch.nn.Module, hf_model_path: str,
     return model
 
 
+def save_model_in_chunks(model, save_path, max_size=4 * 1024 * 1024 * 1024):
+    state_dict = model.state_dict()
+    chunk = {}
+    chunk_size = 0
+    chunk_idx = 0
+    chunks = []
+
+    for name, param in state_dict.items():
+        if isinstance(param, torch.Tensor):
+            param_size = param.numel() * param.element_size()
+        else:
+            param_size = len(param.getbuffer())
+
+        if chunk_size + param_size > max_size:
+            chunks.append(chunk)
+            chunk = {}
+            chunk_size = 0
+            chunk_idx += 1
+        chunk[name] = param
+        chunk_size += param_size
+
+    if chunk:
+        chunks.append(chunk)
+
+    total_chunks = len(chunks)
+    for idx, chunk in enumerate(chunks):
+        chunk_save_path = os.path.join(
+            save_path, f"model-{(idx+1):05d}-of-{total_chunks:05d}.pt")
+        torch.save(chunk, chunk_save_path)
+        print(f'Saved chunk #{idx + 1} of {total_chunks} to {chunk_save_path}')
+
+
 def convert_and_save_model(config_file: str, hf_model_path: str,
                            save_path: str):
     with open(config_file) as f:
@@ -119,7 +139,7 @@ def convert_and_save_model(config_file: str, hf_model_path: str,
     for name, param in model.named_parameters():
         print(f"Parameter: {name}, dtype: {param.dtype}")
 
-    torch.save(model.state_dict(), save_path)
+    save_model_in_chunks(model, save_path)
     print(f'Model saved to {save_path}')
 
 

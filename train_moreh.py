@@ -61,15 +61,12 @@ def create_train_data_loader(train_dataset_path, world_size, batch_size,
 
 def train(
         config_file: str = "conigs/llama-3.1-70b.moreh.json",
-        model_name: str = "llama",
         model_path: str = "/path/to/model",
         dataset_path: str = "/path/to/dataset",
         batch_size: int = 1,
         num_iteration: int = 128 * 16,
         grad_accumlate_pre_steps: int = 8,  # steps to accumlate gradient
         reduce_pre_steps: int = 32,  # steps to do all reduce
-        enable_fp8: bool = True,
-        enable_compile: bool = False,
         seed: int = 1024  # to ensure reproducible
 ):
     torch.manual_seed(seed)
@@ -79,12 +76,10 @@ def train(
     rank = int(os.environ["RANK"])
     assert rank == local_rank, "This script is intended to run on single node for testing"
     world_size = int(os.environ["WORLD_SIZE"])
-    if enable_fp8:
-        enable_compile = False
-        if rank == 0:
-            print(
-                'PyTorch compile currently doesn\'t work with Transformer Engine.'
-            )
+
+    enable_fp8 = True
+    enable_compile = False,
+
     # Construct process group
     if local_rank == 0:
         print("Initing communication")
@@ -98,34 +93,25 @@ def train(
     with open(config_file) as f:
         config = json.load(f)
 
-    if model_name == "llama":
-        model_config = LLaMAConfig(**config)
-    elif model_name == "mistral":
-        model_config = MistralConfig(**config)
-    else:
-        print(
-            "model not supported. please pass either llama or mistral as param"
-        )
+    model_config = LLaMAConfig(**config)
     if local_rank == 0:
         print("Creating model with config: ", model_config)
 
-    if enable_fp8:  # add more model
-        if model_name == "llama":
-            layer_class = Fp8LLaMABlock
-            model = Fp8LLaMA(**asdict(model_config))
-        elif model_name == "mistral":
-            layer_class = Fp8MistralBlock
-            model = Fp8Mistral(**asdict(model_config))
-    else:
-        if model_name == "llama":
-            layer_class = LLaMABlock
-            model = LLaMA(**asdict(model_config))
-        elif model_name == "mistral":
-            layer_class = MistralBlock
-            model = Mistral(**asdict(model_config))
-
     # Load the pre-converted model
-    model.load_state_dict(torch.load(model_path, weights_only=False))
+    model = Fp8LLaMA(**asdict(model_config))
+
+    if os.path.isdir(model_path):
+        model_files = sorted([
+            os.path.join(model_path, f) for f in os.listdir(model_path)
+            if f.endswith(".pt")
+        ])
+        for model_file in model_files:
+            state_dict = torch.load(model_file, weights_only=False)
+            model.load_state_dict(state_dict, strict=False)
+            print(f"Loaded model from {model_file}")
+    else:
+        model = torch.load(model_path, weights_only=False)
+        print(f"Loaded model from {model_path}")
 
     model_config.estimate_flops_per_token(
         model, batch_size)  # Need to calculate before wrapping in FSDP
@@ -134,7 +120,9 @@ def train(
         print(
             f"Loaded model on CPU with number of parameters: {sum(p.numel() for p in model.parameters())/1e9:.2f}B"
         )
-        # print(f"Model:\n{model}")
+        print(f"Model:\n{model}")
+        for name, param in model.named_parameters():
+            print(f"Parameter: {name}, dtype: {param.dtype}")
 
     # FSDP
     model = FSDP(model,
