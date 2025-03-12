@@ -59,6 +59,13 @@ def create_train_data_loader(train_dataset_path, world_size, batch_size,
     return data_loader
 
 
+def sleep_with_dots(seconds):
+    for i in range(seconds):
+        print('.', end='', flush=True)
+        time.sleep(1)
+    print()
+
+
 def train(
         config_file: str = "conigs/llama-3.1-70b.moreh.json",
         model_path: str = "/path/to/model",
@@ -99,7 +106,9 @@ def train(
         print("Creating model with config: ", model_config)
 
     # Load the pre-converted model
-    model = Fp8LLaMA(**asdict(model_config))
+    model = Fp8LLaMA(**asdict(model_config)).cpu()
+    if local_rank == 0:
+        print(f"Initialized model on rank {local_rank}")
 
     if os.path.isdir(model_path):
         model_files = sorted([
@@ -107,12 +116,14 @@ def train(
             if f.endswith(".pt")
         ])
         for model_file in model_files:
-            state_dict = torch.load(model_file, weights_only=False)
+            state_dict = torch.load(model_file,
+                                    weights_only=False,
+                                    map_location="cpu")
             model.load_state_dict(state_dict, strict=False)
-            print(f"Loaded model from {model_file}")
+            print(f"[RANK: {local_rank}] Loaded model from {model_file}")
     else:
-        model = torch.load(model_path, weights_only=False)
-        print(f"Loaded model from {model_path}")
+        model = torch.load(model_path, weights_only=False, map_location="cpu")
+        print(f"[RANK: {local_rank}] Loaded model from {model_path}")
 
     model_config.estimate_flops_per_token(
         model, batch_size)  # Need to calculate before wrapping in FSDP
@@ -122,8 +133,8 @@ def train(
             f"Loaded model on CPU with number of parameters: {sum(p.numel() for p in model.parameters())/1e9:.2f}B"
         )
         print(f"Model:\n{model}")
-        for name, param in model.named_parameters():
-            print(f"Parameter: {name}, dtype: {param.dtype}")
+        #for name, param in model.named_parameters():
+        #    print(f"Parameter: {name}, dtype: {param.dtype}")
 
     # FSDP
     model = FSDP(model,
@@ -134,6 +145,11 @@ def train(
                  auto_wrap_policy=partial(transformer_auto_wrap_policy,
                                           transformer_layer_cls={layer_class}),
                  use_orig_params=True)
+    print(f"Model wrapped in FSDP on rank {local_rank}")
+
+    model = model.cuda()
+    print(f"Model moved to GPU on {local_rank}")
+
     if enable_fp8:
         prepare_te_modules_for_fsdp(model)
         fp8_format = Format.HYBRID  # E4M3 during forward pass, E5M2 during backward pass
@@ -169,6 +185,12 @@ def train(
                                            model_config)
     last_time = time.time()
 
+    #torch.cuda.empty_cache()
+    #print("Cache cleared")
+    #sleep_with_dots(30)
+
+    print("Start training")
+
     for step_idx, data_batch in enumerate(data_loader):
         input = data_batch["input_ids"]
         labels = data_batch["labels"]
@@ -184,9 +206,15 @@ def train(
             loss = F.cross_entropy(logits.flatten(0, 1), labels.flatten())
             loss /= grad_accumlate_pre_steps
 
+        print("Forward pass done")
+        sleep_with_dots(30)
+
         loss.backward()
         ddp_loss[0] += loss.item()
         ddp_loss[1] += input.size(0)
+
+        print("Backward pass done")
+        sleep_with_dots(30)
 
         if (step_idx + 1) % grad_accumlate_pre_steps == 0:
             # https://github.com/foundation-model-stack/fms-fsdp/blob/0fdb43dcfd31ab093f8d873b58b0b531dd0818b1/fms_fsdp/utils/train_utils.py#L94
