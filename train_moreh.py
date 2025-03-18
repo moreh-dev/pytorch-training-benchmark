@@ -74,6 +74,8 @@ def train(
         num_iteration: int = 128 * 16,
         grad_accumlate_pre_steps: int = 8,  # steps to accumlate gradient
         reduce_pre_steps: int = 32,  # steps to do all reduce
+        enable_fp8: bool = False,
+        enable_compile: bool = False,
         seed: int = 1024  # to ensure reproducible
 ):
     torch.manual_seed(seed)
@@ -83,10 +85,12 @@ def train(
     rank = int(os.environ["RANK"])
     assert rank == local_rank, "This script is intended to run on single node for testing"
     world_size = int(os.environ["WORLD_SIZE"])
-
-    enable_fp8 = True
-    enable_compile = False
-
+    if enable_fp8:
+        enable_compile = False
+        if rank == 0:
+            print(
+                'PyTorch compile currently doesn\'t work with Transformer Engine.'
+            )
     # Construct process group
     if local_rank == 0:
         print("Initing communication")
@@ -97,16 +101,27 @@ def train(
     # Configure training setup
     if local_rank == 0:
         print("Using config", config_file)
+        print(f"enable_fp8: {enable_fp8==True}")
+        print(f"enable_compile: {enable_compile==True}")
     with open(config_file) as f:
         config = json.load(f)
 
-    layer_class = Fp8LLaMABlock
     model_config = LLaMAConfig(**config)
+
     if local_rank == 0:
         print("Creating model with config: ", model_config)
 
+    if enable_fp8:  # add more model
+        layer_class = Fp8LLaMABlock
+        model = Fp8LLaMA(**asdict(model_config)).cpu()
+    else:
+        layer_class = LLaMABlock
+        model = LLaMA(**asdict(model_config)).cpu()
+
+    for name, param in model.named_parameters():
+        print(f"Parameter: {name}, dtype: {param.dtype}, shape: {param.shape}")
+
     # Load the pre-converted model
-    model = Fp8LLaMA(**asdict(model_config)).cpu()
     if local_rank == 0:
         print(f"Initialized model on rank {local_rank}")
 
@@ -122,7 +137,10 @@ def train(
             model.load_state_dict(state_dict, strict=False)
             print(f"[RANK: {local_rank}] Loaded model from {model_file}")
     else:
-        model = torch.load(model_path, weights_only=False, map_location="cpu")
+        state_dict = torch.load(model_path,
+                                weights_only=False,
+                                map_location="cpu")
+        model.load_state_dict(state_dict, strict=False)
         print(f"[RANK: {local_rank}] Loaded model from {model_path}")
 
     model_config.estimate_flops_per_token(
