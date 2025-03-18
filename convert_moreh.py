@@ -3,7 +3,7 @@ import json
 import os
 import torch
 from dataclasses import asdict
-from llama import LLaMAConfig, Fp8LLaMA
+from llama import LLaMAConfig, Fp8LLaMA, LLaMA, LLaMABlock
 from transformers import AutoModelForCausalLM
 
 
@@ -16,14 +16,15 @@ def copy_weight(tensor_from, tensor_to):
         tensor_to.data.copy_(tensor_from.detach())
 
 
-def convert_model(model: torch.nn.Module, hf_model_path: str,
-                  config: dict) -> torch.nn.Module:
+def convert_model(model: torch.nn.Module, hf_model_path: str, config: dict,
+                  enable_fp8: bool) -> torch.nn.Module:
     torch.cuda.empty_cache()
 
     hf_model = AutoModelForCausalLM.from_pretrained(
         hf_model_path,
         use_cache=False,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch.float32,
+        device_map="cpu",
         use_flash_attention_2=False,
         max_position_embeddings=config['max_seq_len'],
         local_files_only=True,
@@ -33,19 +34,17 @@ def convert_model(model: torch.nn.Module, hf_model_path: str,
     print(f'{len(hf_model.model.layers)} layers detected')
 
     # CPU RAM 활용
-    hf_embed_tokens_w = hf_model.model.embed_tokens.weight.cpu()
-    hf_lm_head_w = hf_model.lm_head.weight.cpu()
-    hf_norm_w = hf_model.model.norm.weight.cpu()
+    hf_embed_tokens_w = hf_model.model.embed_tokens.weight
+    hf_lm_head_w = hf_model.lm_head.weight
+    hf_norm_w = hf_model.model.norm.weight
 
     copy_weight(hf_embed_tokens_w, model.embedding.weight)
-    copy_weight(hf_lm_head_w, model.norm_lm_head.weight)
-    copy_weight(hf_norm_w, model.norm_lm_head.layer_norm_weight)
-
-    print(f'hf_embed_tokens_w: {hf_embed_tokens_w.dtype}')
-    print(f'model.embedding.weight: {model.embedding.weight.dtype}')
-
-    del hf_embed_tokens_w, hf_lm_head_w, hf_norm_w
-    torch.cuda.empty_cache()
+    if enable_fp8:
+        copy_weight(hf_lm_head_w, model.lm_head.weight)
+        copy_weight(hf_norm_w, model.norm.weight)
+    else:
+        copy_weight(hf_lm_head_w, model.norm_lm_head.weight)
+        copy_weight(hf_norm_w, model.norm_lm_head.layer_norm_weight)
 
     for i in range(config['num_layers']):
         hf_layer = hf_model.model.layers[i]
@@ -53,39 +52,49 @@ def convert_model(model: torch.nn.Module, hf_model_path: str,
 
         # Multihead Attention
         hf_self_attn = hf_layer.self_attn
-        new_self_attention = new_layer.self_attention
 
-        hf_self_attn_input_layernorm_w = hf_layer.input_layernorm.weight.cpu()
-        hf_self_attn_qkv_w = hf_self_attn.qkv_proj.weight.cpu()
-        hf_self_attn_o_w = hf_self_attn.o_proj.weight.cpu()
+        hf_self_attn_input_layernorm_w = hf_layer.input_layernorm.weight
+        hf_self_attn_qkv_w = hf_self_attn.qkv_proj.weight
+        hf_self_attn_o_w = hf_self_attn.o_proj.weight
 
-        copy_weight(hf_self_attn_input_layernorm_w,
-                    new_self_attention.layernorm_qkv.layer_norm_weight)
-        copy_weight(hf_self_attn_qkv_w,
-                    new_self_attention.layernorm_qkv.weight)
-        copy_weight(hf_self_attn_o_w, new_self_attention.proj.weight)
-
-        del hf_self_attn_input_layernorm_w, hf_self_attn_qkv_w, hf_self_attn_o_w
-        torch.cuda.empty_cache()
+        if enable_fp8:
+            copy_weight(
+                hf_self_attn_input_layernorm_w,
+                new_layer.self_attention.layernorm_qkv.layer_norm_weight)
+            copy_weight(hf_self_attn_qkv_w,
+                        new_layer.self_attention.layernorm_qkv.weight)
+            copy_weight(hf_self_attn_o_w, new_layer.self_attention.proj.weight)
+        else:
+            copy_weight(hf_self_attn_input_layernorm_w,
+                        new_layer.attn_norm.weight)
+            copy_weight(hf_self_attn_qkv_w, new_layer.attn.in_proj.weight)
+            copy_weight(hf_self_attn_o_w, new_layer.attn.out_proj.weight)
 
         # LayerNormMLP
         hf_mlp = hf_layer.mlp
-        new_mlp = new_layer.layernorm_mlp
 
-        hf_mlp_post_attn_layernorm_w = hf_layer.post_attention_layernorm.weight.cpu(
-        )
-        hf_mlp_fc1_w = torch.cat(
-            [hf_mlp.gate_proj.weight, hf_mlp.up_proj.weight], dim=0).cpu()
-        hf_mlp_fc2_w = hf_mlp.down_proj.weight.cpu()
+        if enable_fp8:
+            hf_mlp_post_attn_layernorm_w = hf_layer.post_attention_layernorm.weight
+            hf_mlp_fc1_w = torch.cat(
+                [hf_mlp.gate_proj.weight, hf_mlp.up_proj.weight], dim=0)
+            hf_mlp_fc2_w = hf_mlp.down_proj.weight
 
-        copy_weight(hf_mlp_post_attn_layernorm_w, new_mlp.layer_norm_weight)
-        copy_weight(hf_mlp_fc1_w, new_mlp.fc1_weight)
-        copy_weight(hf_mlp_fc2_w, new_mlp.fc2_weight)
-
-        del hf_mlp_post_attn_layernorm_w, hf_mlp_fc1_w, hf_mlp_fc2_w
-        torch.cuda.empty_cache()
+            copy_weight(hf_mlp_post_attn_layernorm_w,
+                        new_layer.layernorm_mlp.layer_norm_weight)
+            copy_weight(hf_mlp_fc1_w, new_layer.layernorm_mlp.fc1_weight)
+            copy_weight(hf_mlp_fc2_w, new_layer.layernorm_mlp.fc2_weight)
+        else:
+            copy_weight(hf_layer.post_attention_layernorm.weight,
+                        new_layer.mlp_norm.weight)
+            copy_weight(hf_mlp.up_proj.weight, new_layer.mlp.up_proj.weight)
+            copy_weight(hf_mlp.gate_proj.weight,
+                        new_layer.mlp.gate_proj.weight)
+            copy_weight(hf_mlp.down_proj.weight,
+                        new_layer.mlp.down_proj.weight)
 
         print(f'Layer #{i} conversion completed')
+        del hf_layer
+        torch.cuda.empty_cache()
 
     del hf_model
     torch.cuda.empty_cache()
@@ -126,15 +135,21 @@ def save_model_in_chunks(model, save_path, max_size=4 * 1024 * 1024 * 1024):
         print(f'Saved chunk #{idx + 1} of {total_chunks} to {chunk_save_path}')
 
 
-def convert_and_save_model(config_file: str, hf_model_path: str,
-                           save_path: str):
+def convert_and_save_model(config_file: str,
+                           hf_model_path: str,
+                           save_path: str,
+                           enable_fp8: bool = False):
     with open(config_file) as f:
         config = json.load(f)
 
     model_config = LLaMAConfig(**config)
 
-    model = Fp8LLaMA(**asdict(model_config))
-    model = convert_model(model, hf_model_path, config)
+    if enable_fp8:
+        model = Fp8LLaMA(**asdict(model_config))
+    else:
+        model = LLaMA(**asdict(model_config))
+
+    model = convert_model(model, hf_model_path, config, enable_fp8)
 
     for name, param in model.named_parameters():
         print(f"Parameter: {name}, dtype: {param.dtype}")
