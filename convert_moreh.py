@@ -40,11 +40,11 @@ def convert_model(model: torch.nn.Module, hf_model_path: str, config: dict,
 
     copy_weight(hf_embed_tokens_w, model.embedding.weight)
     if enable_fp8:
-        copy_weight(hf_lm_head_w, model.lm_head.weight)
-        copy_weight(hf_norm_w, model.norm.weight)
-    else:
         copy_weight(hf_lm_head_w, model.norm_lm_head.weight)
         copy_weight(hf_norm_w, model.norm_lm_head.layer_norm_weight)
+    else:
+        copy_weight(hf_lm_head_w, model.lm_head.weight)
+        copy_weight(hf_norm_w, model.norm.weight)
 
     for i in range(config['num_layers']):
         hf_layer = hf_model.model.layers[i]
